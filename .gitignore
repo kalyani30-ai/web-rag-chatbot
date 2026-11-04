@@ -1,0 +1,26 @@
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.log
+.streamlit/secrets.toml
+*.sqlite3
+*.sqlite3-*
+*.db
+.pytest_cache/
+.coverage
+htmlcov/
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Local website corpus; deployment can start empty and index pages at runtime.
+faiss_index.bin
+chunks.json
