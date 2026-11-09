@@ -25,7 +25,7 @@ def _connect(db_path: str | Path = DB_PATH) -> sqlite3.Connection:
     """Open a database connection and ensure its parent directory exists."""
     database_path = Path(db_path)
     database_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(database_path, timeout=10)
+    connection = sqlite3.connect(str(database_path), timeout=10)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
@@ -33,7 +33,8 @@ def _connect(db_path: str | Path = DB_PATH) -> sqlite3.Connection:
 
 def initialize_chat_history(db_path: str | Path = DB_PATH) -> None:
     """Create the conversation and message tables when they do not exist."""
-    with _connect(db_path) as connection:
+    connection = _connect(db_path)
+    try:
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS conversations (
@@ -61,20 +62,28 @@ def initialize_chat_history(db_path: str | Path = DB_PATH) -> None:
                 ON messages(conversation_id, id);
             """
         )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def create_conversation(db_path: str | Path = DB_PATH) -> int:
     """Create a new empty conversation and return its database ID."""
     initialize_chat_history(db_path)
-    with _connect(db_path) as connection:
+    connection = _connect(db_path)
+    try:
         cursor = connection.execute("INSERT INTO conversations DEFAULT VALUES")
+        connection.commit()
         return int(cursor.lastrowid)
+    finally:
+        connection.close()
 
 
 def list_conversations(db_path: str | Path = DB_PATH) -> list[Conversation]:
     """Return saved conversations with the most recently active first."""
     initialize_chat_history(db_path)
-    with _connect(db_path) as connection:
+    connection = _connect(db_path)
+    try:
         rows = connection.execute(
             """
             SELECT id, title, updated_at
@@ -82,6 +91,8 @@ def list_conversations(db_path: str | Path = DB_PATH) -> list[Conversation]:
             ORDER BY updated_at DESC, id DESC
             """
         ).fetchall()
+    finally:
+        connection.close()
     return [
         {
             "id": int(row["id"]),
@@ -98,7 +109,8 @@ def load_messages(
 ) -> list[ChatMessage]:
     """Load a conversation's messages in their original order."""
     initialize_chat_history(db_path)
-    with _connect(db_path) as connection:
+    connection = _connect(db_path)
+    try:
         rows = connection.execute(
             """
             SELECT role, content, sources_json
@@ -108,6 +120,8 @@ def load_messages(
             """,
             (conversation_id,),
         ).fetchall()
+    finally:
+        connection.close()
     messages: list[ChatMessage] = []
     for row in rows:
         sources = json.loads(row["sources_json"])
@@ -133,8 +147,10 @@ def save_message(
     """Save a message and title a conversation from its first user question."""
     if not content.strip():
         raise ValueError("Chat messages cannot be empty.")
+    initialize_chat_history(db_path)
     sources_json = json.dumps(sources or [], ensure_ascii=False)
-    with _connect(db_path) as connection:
+    connection = _connect(db_path)
+    try:
         cursor = connection.execute(
             """
             INSERT INTO messages (conversation_id, role, content, sources_json)
@@ -165,13 +181,17 @@ def save_message(
                 """,
                 (conversation_id,),
             )
+        connection.commit()
         if cursor.rowcount != 1:
             raise sqlite3.IntegrityError("The chat message could not be saved.")
+    finally:
+        connection.close()
 
 
 def clear_conversation(conversation_id: int, db_path: str | Path = DB_PATH) -> None:
     """Remove a conversation's messages while keeping it available as a new chat."""
-    with _connect(db_path) as connection:
+    connection = _connect(db_path)
+    try:
         connection.execute(
             "DELETE FROM messages WHERE conversation_id = ?",
             (conversation_id,),
@@ -185,17 +205,24 @@ def clear_conversation(conversation_id: int, db_path: str | Path = DB_PATH) -> N
             """,
             (conversation_id,),
         )
+        connection.commit()
         if cursor.rowcount != 1:
             raise sqlite3.IntegrityError("The chat could not be cleared.")
+    finally:
+        connection.close()
 
 
 def delete_conversation(conversation_id: int, db_path: str | Path = DB_PATH) -> None:
     """Permanently delete a conversation and its messages."""
     initialize_chat_history(db_path)
-    with _connect(db_path) as connection:
+    connection = _connect(db_path)
+    try:
         cursor = connection.execute(
             "DELETE FROM conversations WHERE id = ?",
             (conversation_id,),
         )
+        connection.commit()
         if cursor.rowcount != 1:
             raise sqlite3.IntegrityError("The chat could not be deleted.")
+    finally:
+        connection.close()
