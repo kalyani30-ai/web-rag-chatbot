@@ -212,6 +212,30 @@ def clear_conversation(conversation_id: int, db_path: str | Path = DB_PATH) -> N
         connection.close()
 
 
+def rename_conversation(
+    conversation_id: int,
+    title: str,
+    db_path: str | Path = DB_PATH,
+) -> None:
+    """Rename one conversation without changing its messages or identifier."""
+    normalized_title = " ".join(title.split())
+    if not normalized_title:
+        raise ValueError("Conversation titles cannot be empty.")
+
+    initialize_chat_history(db_path)
+    connection = _connect(db_path)
+    try:
+        cursor = connection.execute(
+            "UPDATE conversations SET title = ? WHERE id = ?",
+            (normalized_title, conversation_id),
+        )
+        connection.commit()
+        if cursor.rowcount != 1:
+            raise sqlite3.IntegrityError("The conversation could not be renamed.")
+    finally:
+        connection.close()
+
+
 def delete_conversation(conversation_id: int, db_path: str | Path = DB_PATH) -> None:
     """Permanently delete a conversation and its messages."""
     initialize_chat_history(db_path)

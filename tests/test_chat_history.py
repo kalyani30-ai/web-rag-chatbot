@@ -11,6 +11,7 @@ from chat_history import (
     delete_conversation,
     list_conversations,
     load_messages,
+    rename_conversation,
     save_message,
 )
 
@@ -73,6 +74,63 @@ class ChatHistoryTests(unittest.TestCase):
 
         self.assertEqual(load_messages(conversation_id, self.database_path), [])
         self.assertEqual(list_conversations(self.database_path)[0]["title"], "New chat")
+
+    def test_rename_updates_only_the_selected_conversation_and_preserves_messages(self) -> None:
+        first_id = create_conversation(self.database_path)
+        second_id = create_conversation(self.database_path)
+        save_message(first_id, "user", "First chat", db_path=self.database_path)
+        save_message(
+            first_id,
+            "assistant",
+            "An answer with a source.",
+            [{"title": "Example", "url": "https://example.com"}],
+            db_path=self.database_path,
+        )
+        save_message(second_id, "user", "Second chat", db_path=self.database_path)
+        original_messages = load_messages(first_id, self.database_path)
+
+        rename_conversation(first_id, "  Research   notes  ", self.database_path)
+
+        conversations = {
+            conversation["id"]: conversation["title"]
+            for conversation in list_conversations(self.database_path)
+        }
+        self.assertEqual(conversations[first_id], "Research notes")
+        self.assertEqual(conversations[second_id], "Second chat")
+        self.assertEqual(load_messages(first_id, self.database_path), original_messages)
+        self.assertEqual(load_messages(second_id, self.database_path)[0]["content"], "Second chat")
+
+    def test_rename_allows_duplicate_titles_without_changing_the_other_chat(self) -> None:
+        first_id = create_conversation(self.database_path)
+        second_id = create_conversation(self.database_path)
+
+        rename_conversation(first_id, "Shared title", self.database_path)
+        rename_conversation(second_id, "Shared title", self.database_path)
+
+        self.assertEqual(
+            {chat["id"] for chat in list_conversations(self.database_path)},
+            {first_id, second_id},
+        )
+        self.assertEqual(
+            [chat["title"] for chat in list_conversations(self.database_path)],
+            ["Shared title", "Shared title"],
+        )
+
+    def test_rename_rejects_empty_titles_without_modifying_conversation(self) -> None:
+        conversation_id = create_conversation(self.database_path)
+        save_message(conversation_id, "user", "Existing title", db_path=self.database_path)
+
+        with self.assertRaisesRegex(ValueError, "cannot be empty"):
+            rename_conversation(conversation_id, " \n\t ", self.database_path)
+
+        self.assertEqual(list_conversations(self.database_path)[0]["title"], "Existing title")
+
+    def test_rename_missing_conversation_reports_error(self) -> None:
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "could not be renamed",
+        ):
+            rename_conversation(999, "Missing chat", self.database_path)
 
     def test_delete_removes_conversation_and_its_messages(self) -> None:
         conversation_id = create_conversation(self.database_path)

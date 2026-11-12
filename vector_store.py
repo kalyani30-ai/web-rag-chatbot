@@ -2,6 +2,7 @@
 
 import json
 import os
+from collections.abc import Iterable
 from pathlib import Path
 
 import faiss
@@ -99,6 +100,47 @@ def append_to_vector_store(
     updated_index = faiss.clone_index(index)
     updated_index.add(vectors)
     updated_chunks = [*chunks, *new_chunks]
+    save_vector_store(updated_index, updated_chunks, index_path, chunks_path)
+    return updated_index, updated_chunks
+
+
+def append_to_vector_store_batches(
+    index: faiss.Index,
+    chunks: list[dict[str, str]],
+    new_chunks: list[dict[str, str]],
+    embedding_batches: Iterable[np.ndarray],
+    batch_size: int = 32,
+    index_path: str | Path = INDEX_PATH,
+    chunks_path: str | Path = CHUNKS_PATH,
+) -> tuple[faiss.Index, list[dict[str, str]]]:
+    """Append bounded embedding batches and persist only after all batches validate."""
+    if not new_chunks:
+        return index, chunks
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1.")
+
+    updated_index = faiss.clone_index(index)
+    updated_chunks = [*chunks]
+    offset = 0
+    for batch in embedding_batches:
+        expected_count = min(batch_size, len(new_chunks) - offset)
+        if expected_count < 1:
+            raise ValueError("Received more embedding batches than new chunks.")
+        vectors = np.ascontiguousarray(batch, dtype=np.float32)
+        if vectors.ndim != 2 or vectors.shape != (expected_count, index.d):
+            raise ValueError(
+                f"Each embedding batch must contain {expected_count} "
+                f"vectors of dimension {index.d}."
+            )
+        updated_index.add(vectors)
+        updated_chunks.extend(new_chunks[offset : offset + expected_count])
+        offset += expected_count
+
+    if offset != len(new_chunks):
+        raise ValueError(
+            f"Received embeddings for {offset} of {len(new_chunks)} new chunks."
+        )
+
     save_vector_store(updated_index, updated_chunks, index_path, chunks_path)
     return updated_index, updated_chunks
 

@@ -1,10 +1,11 @@
 [server]
 headless = true
 maxUploadSize = 20
+fileWatcherType = "none"
 
 [theme]
 base = "dark"
-primaryColor = "#72dfcb"
-backgroundColor = "#0a1220"
-secondaryBackgroundColor = "#101c2e"
-textColor = "#e8f0fb"
+primaryColor = "#FFFFFF"
+backgroundColor = "#000000"
+secondaryBackgroundColor = "#0A0A0A"
+textColor = "#FFFFFF"

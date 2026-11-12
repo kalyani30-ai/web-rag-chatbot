@@ -24,7 +24,9 @@ when available; their presence does not independently verify every answer.
 - Incrementally append newly indexed website chunks.
 - Upload supported PDF, DOCX, text, image, and video files. Uploads are available
   for the current Streamlit session only.
-- Local SQLite conversation history, source display, and chat deletion controls.
+- Local SQLite conversation history, source display, and chat rename, clear, and
+  deletion controls.
+- Session-persisted dark and light appearance settings with monochrome styling.
 - Groq connection test and user-facing API/network errors.
 
 ## Technology stack
@@ -188,6 +190,9 @@ make real Groq or Tavily requests:
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+The conversation-history tests also cover renaming, duplicate titles, empty-title
+validation, and message preservation.
 
 An optional live Groq connectivity check is separate and does make a real API
 request:

@@ -17,7 +17,12 @@ from groq_client import (
     groq_api_key_configured,
 )
 from api_keys import get_api_key
-from embeddings import EmbeddingModelError, get_embedding_model
+from embeddings import (
+    EMBEDDING_BATCH_SIZE,
+    EmbeddingModelError,
+    get_embedding_model,
+    iter_embedding_batches,
+)
 from processor import split_into_chunks
 from prompt_builder import build_rag_prompt
 from rag_pipeline import retrieve_relevant_chunks, update_knowledge_base
@@ -30,6 +35,7 @@ from scraper import (
 from search import build_search_query, search_web
 from vector_store import (
     append_to_vector_store,
+    append_to_vector_store_batches,
     create_vector_store,
     load_vector_store,
     search_vector_store,
@@ -49,6 +55,15 @@ class CountingEmbeddingModel:
         self.last_texts = texts
         self.convert_to_numpy = convert_to_numpy
         return np.asarray([[1.0, 0.0]], dtype=np.float32)
+
+
+class FixedEmbeddingModel:
+    """Return one deterministic 384-dimensional vector for indexing and queries."""
+
+    def encode(self, texts: list[str], **kwargs) -> np.ndarray:
+        vectors = np.zeros((len(texts), 384), dtype=np.float32)
+        vectors[:, 0] = 1.0
+        return vectors
 
 
 class CoreBehaviorTests(unittest.TestCase):
@@ -203,15 +218,57 @@ class CoreBehaviorTests(unittest.TestCase):
                 load_vector_store(index_path, chunks_path)
 
     def test_embedding_model_download_failure_has_a_friendly_error(self) -> None:
-        get_embedding_model.cache_clear()
+        get_embedding_model.clear()
         try:
-            with patch("embeddings.SentenceTransformer", side_effect=OSError):
+            with patch("embeddings._load_sentence_transformer", side_effect=OSError):
                 with self.assertRaisesRegex(
                     EmbeddingModelError, "model files may need to be downloaded"
                 ):
                     get_embedding_model()
         finally:
-            get_embedding_model.cache_clear()
+            get_embedding_model.clear()
+
+    def test_embedding_model_is_loaded_once_and_cached(self) -> None:
+        model = object()
+        get_embedding_model.clear()
+        try:
+            with patch(
+                "embeddings._load_sentence_transformer",
+                return_value=model,
+            ) as load_model:
+                self.assertIs(get_embedding_model(), model)
+                self.assertIs(get_embedding_model(), model)
+            load_model.assert_called_once_with()
+        finally:
+            get_embedding_model.clear()
+
+    def test_embedding_batches_are_bounded_and_keep_text_order(self) -> None:
+        model = Mock()
+        model.encode.side_effect = lambda texts, **kwargs: np.asarray(
+            [[float(index), 0.0] for index, _ in enumerate(texts)],
+            dtype=np.float32,
+        )
+        with patch("embeddings.get_embedding_model", return_value=model):
+            batches = list(
+                iter_embedding_batches(
+                    (f"text {number}" for number in range(5)),
+                    batch_size=2,
+                )
+            )
+
+        self.assertEqual([len(batch) for batch in batches], [2, 2, 1])
+        self.assertEqual(
+            [call.args[0] for call in model.encode.call_args_list],
+            [["text 0", "text 1"], ["text 2", "text 3"], ["text 4"]],
+        )
+
+    def test_empty_embedding_batch_does_not_load_model(self) -> None:
+        with patch("embeddings.get_embedding_model") as get_model:
+            self.assertEqual(
+                list(iter_embedding_batches([], batch_size=EMBEDDING_BATCH_SIZE)),
+                [],
+            )
+        get_model.assert_not_called()
 
     def test_prompt_contains_source_citation_and_question(self) -> None:
         prompt = build_rag_prompt(
@@ -342,6 +399,112 @@ class CoreBehaviorTests(unittest.TestCase):
         self.assertEqual(updated_chunks, new_chunks)
         self.assertEqual(saved_chunks, new_chunks)
 
+    def test_batched_index_append_persists_all_vectors_and_sources(self) -> None:
+        existing_chunks = [
+            {"text": "existing", "url": "https://existing.example"}
+        ]
+        new_chunks = [
+            {"text": "first new", "url": "https://new.example/1"},
+            {"text": "second new", "url": "https://new.example/2"},
+            {"text": "third new", "url": "https://new.example/3"},
+        ]
+        existing_vector = np.zeros(384, dtype=np.float32)
+        existing_vector[0] = 1.0
+        first_vector = np.zeros(384, dtype=np.float32)
+        first_vector[1] = 1.0
+        second_vector = np.ones(384, dtype=np.float32)
+        third_vector = np.zeros(384, dtype=np.float32)
+        third_vector[2] = 1.0
+        index = create_vector_store(existing_vector.reshape(1, -1))
+        batches = [
+            np.asarray([first_vector, second_vector], dtype=np.float32),
+            third_vector.reshape(1, -1),
+        ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            index_path = Path(temporary_directory) / "index.bin"
+            chunks_path = Path(temporary_directory) / "chunks.json"
+            updated_index, updated_chunks = append_to_vector_store_batches(
+                index,
+                existing_chunks,
+                new_chunks,
+                batches,
+                batch_size=2,
+                index_path=index_path,
+                chunks_path=chunks_path,
+            )
+            saved_index, saved_chunks = load_vector_store(index_path, chunks_path)
+
+        self.assertEqual(updated_index.ntotal, 4)
+        self.assertEqual(saved_index.ntotal, 4)
+        self.assertEqual(updated_chunks, existing_chunks + new_chunks)
+        self.assertEqual(saved_chunks, existing_chunks + new_chunks)
+        _, positions = search_vector_store(
+            saved_index,
+            first_vector,
+            top_k=1,
+        )
+        self.assertEqual(saved_chunks[int(positions[0][0])]["url"], new_chunks[0]["url"])
+
+    def test_batched_website_ingestion_remains_retrievable_with_citations(self) -> None:
+        model = FixedEmbeddingModel()
+        page = {
+            "url": "https://research.example/article",
+            "title": "Research article",
+            "content": "The article explains a useful research finding.",
+        }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            index_path = Path(temporary_directory) / "index.bin"
+            chunks_path = Path(temporary_directory) / "chunks.json"
+
+            def append_to_temporary_store(
+                index,
+                chunks,
+                new_chunks,
+                embedding_batches,
+                batch_size,
+            ):
+                return append_to_vector_store_batches(
+                    index,
+                    chunks,
+                    new_chunks,
+                    embedding_batches,
+                    batch_size=batch_size,
+                    index_path=index_path,
+                    chunks_path=chunks_path,
+                )
+
+            with (
+                patch("rag_pipeline.scrape_website_with_metadata", return_value=page),
+                patch("embeddings.get_embedding_model", return_value=model),
+                patch(
+                    "rag_pipeline.append_to_vector_store_batches",
+                    side_effect=append_to_temporary_store,
+                ),
+            ):
+                index, chunks, report = update_knowledge_base(
+                    ["https://research.example/article"],
+                    faiss.IndexFlatL2(384),
+                    [],
+                )
+
+            saved_index, saved_chunks = load_vector_store(index_path, chunks_path)
+            query_embedding = model.encode(["What did the article find?"])[0]
+            retrieved = retrieve_relevant_chunks(
+                "What did the article find?",
+                saved_index,
+                saved_chunks,
+                query_embedding=query_embedding,
+            )
+            prompt = build_rag_prompt("What did the article find?", retrieved)
+
+        self.assertEqual(report["new_chunks"], 1)
+        self.assertEqual(index.ntotal, 1)
+        self.assertEqual(chunks, saved_chunks)
+        self.assertEqual(retrieved[0]["url"], page["url"])
+        self.assertIn("[Source 1: Research article]", prompt)
+        self.assertIn("The article explains a useful research finding.", prompt)
+
     def test_existing_duplicate_url_is_not_scraped(self) -> None:
         chunks = [
             {"text": "existing", "url": "https://example.com/", "title": "Example"}
@@ -366,14 +529,15 @@ class CoreBehaviorTests(unittest.TestCase):
         with (
             patch("rag_pipeline.scrape_website_with_metadata", return_value=page) as scrape,
             patch(
-                "rag_pipeline.generate_embeddings",
-                return_value=np.asarray([[0.0, 1.0]], dtype=np.float32),
+                "rag_pipeline.iter_embedding_batches",
+                return_value=[np.asarray([[0.0, 1.0]], dtype=np.float32)],
             ),
-            patch("rag_pipeline.append_to_vector_store") as append,
+            patch("rag_pipeline.append_to_vector_store_batches") as append,
         ):
-            def append_chunks(old_index, old_chunks, new_chunks, vectors):
-                self.assertEqual(len(new_chunks), len(vectors))
-                return old_index, old_chunks + new_chunks
+            def append_chunks(old_index, old_chunks, added_chunks, batches, batch_size):
+                self.assertEqual(len(added_chunks), 1)
+                self.assertEqual(len(next(iter(batches))), 1)
+                return old_index, old_chunks + added_chunks
 
             append.side_effect = append_chunks
             _, updated_chunks, report = update_knowledge_base(

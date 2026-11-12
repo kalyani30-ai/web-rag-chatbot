@@ -1,8 +1,16 @@
 """Streamlit interface for the local web-grounded research assistant."""
 
+import logging
 import sqlite3
 from hashlib import sha256
 from urllib.parse import urlparse
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+logger.info("Starting Web RAG Assistant.")
 
 import faiss
 import numpy as np
@@ -14,9 +22,14 @@ from chat_history import (
     delete_conversation,
     list_conversations,
     load_messages,
+    rename_conversation,
     save_message,
 )
-from embeddings import get_embedding_model
+from embeddings import (
+    EMBEDDING_BATCH_SIZE,
+    get_embedding_model,
+    iter_embedding_batches,
+)
 from groq_client import (
     CONNECTION_TEST_PROMPT,
     GroqClientError,
@@ -32,15 +45,20 @@ from uploaded_documents import (
     extract_uploaded_content,
 )
 from processor import clean_text, split_into_chunks
-from vector_store import create_vector_store, load_vector_store
+from vector_store import EMBEDDING_DIMENSION, create_vector_store, load_vector_store
 
+
+logger.info("Application modules imported.")
 
 st.set_page_config(
     page_title="Web RAG Assistant",
-    page_icon="🌐",
+    page_icon="R",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+if "theme_mode" not in st.session_state:
+    st.session_state.theme_mode = "Dark Mode"
 
 # Keep the interface styling local to Streamlit so no extra frontend package is needed.
 st.markdown(
@@ -264,17 +282,224 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+theme_colors = {
+    "Dark Mode": {
+        "scheme": "dark",
+        "main": "#000000",
+        "sidebar": "#0A0A0A",
+        "user": "#171717",
+        "input": "#171717",
+        "primary": "#FFFFFF",
+        "secondary": "#A3A3A3",
+        "border": "#292929",
+        "hover": "#242424",
+        "button": "#111111",
+    },
+    "Light Mode": {
+        "scheme": "light",
+        "main": "#FFFFFF",
+        "sidebar": "#F7F7F7",
+        "user": "#F1F1F1",
+        "input": "#FFFFFF",
+        "primary": "#111111",
+        "secondary": "#666666",
+        "border": "#E5E5E5",
+        "hover": "#EAEAEA",
+        "button": "#FFFFFF",
+    },
+}
+theme = theme_colors[st.session_state.theme_mode]
+st.markdown(
+    f"""
+    <style>
+    :root {{
+        color-scheme: {theme["scheme"]};
+        --primary-color: {theme["primary"]};
+        --background-color: {theme["main"]};
+        --secondary-background-color: {theme["sidebar"]};
+        --text-color: {theme["primary"]};
+        --border-color: {theme["border"]};
+        --app-bg: {theme["main"]};
+        --sidebar-bg: {theme["sidebar"]};
+        --user-bg: {theme["user"]};
+        --input-bg: {theme["input"]};
+        --primary: {theme["primary"]};
+        --secondary: {theme["secondary"]};
+        --border: {theme["border"]};
+        --hover: {theme["hover"]};
+        --button-bg: {theme["button"]};
+    }}
+    html, body, .stApp, [data-testid="stAppViewContainer"],
+    [data-testid="stMain"], [data-testid="stMainBlockContainer"] {{
+        color: var(--primary) !important;
+        background: var(--app-bg) !important;
+    }}
+    [data-testid="stHeader"], [data-testid="stBottom"],
+    [data-testid="stBottomBlockContainer"] {{
+        background: var(--app-bg) !important;
+        border-color: var(--border) !important;
+    }}
+    input[type="radio"], input[type="checkbox"] {{
+        accent-color: var(--primary) !important;
+    }}
+    [data-testid="stSidebar"], [data-testid="stSidebarContent"] {{
+        color: var(--primary) !important;
+        background: var(--sidebar-bg) !important;
+        border-color: var(--border) !important;
+    }}
+    [data-testid="stMarkdownContainer"],
+    [data-testid="stMarkdownContainer"] p,
+    [data-testid="stCaptionContainer"], [data-testid="stWidgetLabel"],
+    [data-testid="stMetricLabel"], [data-testid="stMarkdownContainer"] li {{
+        color: var(--secondary) !important;
+    }}
+    h1, h2, h3, h4, strong, label,
+    [data-testid="stMarkdownContainer"] strong,
+    [data-testid="stMetricValue"] {{
+        color: var(--primary) !important;
+    }}
+    [data-testid="stSidebar"] hr {{ border-color: var(--border) !important; }}
+    .hero, .welcome-card {{
+        color: var(--primary) !important;
+        background: var(--app-bg) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: 14px !important;
+        box-shadow: none !important;
+    }}
+    .hero::after, .welcome-card::before, .hero-pills {{ display: none !important; }}
+    .hero h1, .hero p, .hero-kicker {{ color: var(--primary) !important; }}
+    div[data-testid="stChatMessage"] {{
+        color: var(--primary) !important;
+        background: transparent !important;
+        border: 1px solid transparent !important;
+        box-shadow: none !important;
+    }}
+    div[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {{
+        background: var(--user-bg) !important;
+        border-color: var(--border) !important;
+        border-radius: 16px !important;
+    }}
+    div[data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] p,
+    div[data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] li {{
+        color: var(--primary) !important;
+        line-height: 1.7;
+    }}
+    a, [data-testid="stChatMessage"] a {{
+        color: var(--primary) !important;
+        text-decoration-color: var(--secondary) !important;
+    }}
+    input, textarea, [data-baseweb="input"] > div,
+    [data-baseweb="textarea"] > div, [data-baseweb="select"] > div {{
+        color: var(--primary) !important;
+        background: var(--input-bg) !important;
+        border-color: var(--border) !important;
+    }}
+    input::placeholder, textarea::placeholder {{
+        color: var(--secondary) !important;
+    }}
+    div[data-testid="stChatInput"] {{
+        color: var(--primary) !important;
+        background: var(--input-bg) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: 16px !important;
+        box-shadow: none !important;
+    }}
+    div[data-testid="stChatInput"]:focus-within {{
+        border-color: var(--secondary) !important;
+        box-shadow: 0 0 0 1px var(--secondary) !important;
+    }}
+    div[data-testid="stChatInput"] textarea,
+    div[data-testid="stChatInput"] > div {{
+        color: var(--primary) !important;
+        background: transparent !important;
+    }}
+    .stButton > button, [data-testid="stLinkButton"] a,
+    [data-testid="stFormSubmitButton"] button,
+    [data-testid="stChatInput"] button {{
+        color: var(--primary) !important;
+        background: var(--button-bg) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: 10px !important;
+        box-shadow: none !important;
+    }}
+    .stButton > button:hover, [data-testid="stLinkButton"] a:hover,
+    [data-testid="stFormSubmitButton"] button:hover,
+    [data-testid="stChatInput"] button:hover {{
+        color: var(--primary) !important;
+        background: var(--hover) !important;
+        border-color: var(--secondary) !important;
+        transform: none !important;
+    }}
+    .stButton > button:disabled,
+    [data-testid="stChatInput"] button:disabled {{
+        color: var(--secondary) !important;
+        background: var(--button-bg) !important;
+        opacity: .6;
+    }}
+    [data-testid="stExpander"], [data-testid="stStatusWidget"],
+    [data-testid="stAlert"], [data-testid="stFileUploader"],
+    [data-testid="stMetric"], [data-testid="stPopover"],
+    [data-testid="stFileUploaderDropzone"],
+    [data-baseweb="popover"], [role="dialog"] {{
+        color: var(--primary) !important;
+        background: var(--sidebar-bg) !important;
+        border-color: var(--border) !important;
+        box-shadow: none !important;
+    }}
+    [data-testid="stExpander"] summary,
+    [data-testid="stAlert"] *,
+    [data-testid="stFileUploader"] *,
+    [data-baseweb="popover"] *, [role="dialog"] * {{
+        color: var(--primary) !important;
+    }}
+    [data-testid="stProgressBar"] > div,
+    [data-testid="stProgressBar"] > div > div {{
+        background: var(--border) !important;
+    }}
+    [data-testid="stProgressBar"] > div > div > div {{
+        background: var(--secondary) !important;
+    }}
+    [data-testid="stChatInput"] button[aria-label="Upload files"] {{
+        background: var(--button-bg) !important;
+        border-color: var(--border) !important;
+    }}
+    div[data-testid="stChatInput"] button[aria-label="Send message"],
+    div[data-testid="stChatInput"] button[aria-label="Send message"]:hover,
+    div[data-testid="stChatInput"] button[aria-label="Upload files"],
+    div[data-testid="stChatInput"] button[aria-label="Upload files"]:hover {{
+        color: var(--primary) !important;
+        background: var(--button-bg) !important;
+        border: 1px solid var(--border) !important;
+        box-shadow: none !important;
+    }}
+    div[data-testid="stChatMessage"] [data-testid="stHorizontalBlock"] .stButton > button,
+    div[data-testid="stChatMessage"] [data-testid="stHorizontalBlock"] .stButton > button:hover {{
+        color: var(--primary) !important;
+        background: var(--button-bg) !important;
+        border: 1px solid var(--border) !important;
+        box-shadow: none !important;
+        transform: none !important;
+    }}
+    [role="option"], [data-baseweb="popover"] *,
+    [data-testid="stDialog"] *, [role="dialog"] * {{
+        color: var(--primary) !important;
+        background-color: transparent;
+    }}
+    ::selection {{ color: var(--app-bg); background: var(--secondary); }}
+    @media (max-width: 700px) {{
+        [data-testid="stMainBlockContainer"] {{ padding: 4.5rem .85rem 6rem; }}
+        .hero {{ padding: 1.1rem; }}
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 @st.cache_resource
 def load_database() -> tuple[faiss.Index, list[dict[str, str]]]:
     """Load FAISS and its source text once for the lifetime of the app process."""
     return load_vector_store()
-
-
-@st.cache_resource
-def load_embedding_model():
-    """Use Streamlit's resource cache around the shared model loader."""
-    return get_embedding_model()
 
 
 def display_sources(sources: list[dict[str, str]]) -> None:
@@ -361,28 +586,39 @@ def index_uploaded_files(uploaded_files) -> tuple[int, list[str]]:
             }
             for text in chunks
         )
+        del content, extracted_text, chunks
 
     if not pending_chunks:
         return 0, errors
 
-    vectors = load_embedding_model().encode(
-        [chunk["text"] for chunk in pending_chunks],
-        batch_size=32,
-        show_progress_bar=False,
-        convert_to_numpy=True,
-    )
-    vectors = np.ascontiguousarray(vectors, dtype=np.float32)
-    if vectors.ndim != 2 or vectors.shape[0] != len(pending_chunks):
-        raise ValueError("The embedding model returned an invalid upload embedding batch.")
-
     current_index = st.session_state.uploaded_index
-    if current_index is None:
-        updated_index = create_vector_store(vectors)
-    else:
-        if vectors.shape[1] != current_index.d:
-            raise ValueError("Uploaded file embeddings do not match the saved index.")
-        updated_index = faiss.clone_index(current_index)
-        updated_index.add(vectors)
+    updated_index = (
+        faiss.clone_index(current_index)
+        if current_index is not None
+        else None
+    )
+    chunk_offset = 0
+    for vectors in iter_embedding_batches(
+        (chunk["text"] for chunk in pending_chunks),
+        batch_size=EMBEDDING_BATCH_SIZE,
+    ):
+        expected_count = min(
+            EMBEDDING_BATCH_SIZE,
+            len(pending_chunks) - chunk_offset,
+        )
+        if vectors.shape != (expected_count, EMBEDDING_DIMENSION):
+            raise ValueError("Uploaded file embeddings have an invalid shape.")
+        if updated_index is None:
+            updated_index = create_vector_store(vectors)
+        else:
+            if vectors.shape[1] != updated_index.d:
+                raise ValueError("Uploaded file embeddings do not match the saved index.")
+            updated_index.add(vectors)
+        chunk_offset += expected_count
+        del vectors
+
+    if chunk_offset != len(pending_chunks) or updated_index is None:
+        raise ValueError("The embedding model returned an incomplete upload batch.")
 
     st.session_state.uploaded_index = updated_index
     st.session_state.uploaded_chunks.extend(pending_chunks)
@@ -411,7 +647,6 @@ def run_indexing(
         )
         if report["new_chunks"]:
             load_database.clear()
-            updated_index, updated_chunks = load_database()
             status.update(
                 label=(
                     f"Indexed {len(report['added_urls'])} website(s) and "
@@ -438,7 +673,21 @@ def run_indexing(
         progress_bar.empty()
 
 
+st.markdown(
+    """
+    <div class="hero">
+        <div class="hero-kicker">Research workspace</div>
+        <h1>Web RAG Assistant</h1>
+        <p>Bring your files, the live web, and your questions together.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+startup_status = st.empty()
+startup_status.info("Loading saved conversations and the knowledge base...")
+
 try:
+    logger.info("Loading saved chat history.")
     conversations = list_conversations()
     conversation_ids = [conversation["id"] for conversation in conversations]
     if not conversations:
@@ -458,14 +707,8 @@ try:
         st.session_state.messages = load_messages(
             st.session_state.active_conversation_id
         )
-    if (
-        "conversation_selector" not in st.session_state
-        or st.session_state.conversation_selector not in conversation_ids
-    ):
-        st.session_state.conversation_selector = (
-            st.session_state.active_conversation_id
-        )
 except (OSError, sqlite3.Error, ValueError) as error:
+    logger.exception("Could not initialize saved chat history.")
     st.error(f"Saved chat history could not be loaded: {error}")
     st.stop()
 
@@ -479,17 +722,34 @@ if "uploaded_chunks" not in st.session_state:
     st.session_state.uploaded_chunks = []
 if "uploaded_index" not in st.session_state:
     st.session_state.uploaded_index = None
+
 try:
+    logger.info("Loading the saved FAISS knowledge base.")
     index, chunks = load_database()
 except (OSError, RuntimeError, ValueError) as error:
+    logger.exception("Could not load the saved knowledge base.")
     st.error(f"The saved knowledge base could not be loaded: {error}")
     st.stop()
+logger.info(
+    "Startup complete: %d conversations and %d saved chunks.",
+    len(conversations),
+    len(chunks),
+)
+startup_status.empty()
 
 with st.sidebar:
     st.title("Research workspace")
     st.caption(
         "Chat history and indexed websites use local app storage. "
         "Hosted app restarts may reset this data."
+    )
+    st.radio(
+        "Appearance",
+        options=["Dark Mode", "Light Mode"],
+        format_func=lambda mode: (
+            f"☾ {mode}" if mode == "Dark Mode" else f"☼ {mode}"
+        ),
+        key="theme_mode",
     )
     conversation_by_id = {
         conversation["id"]: conversation for conversation in conversations
@@ -504,7 +764,6 @@ with st.sidebar:
             st.error(f"Could not create a new chat: {error}")
             st.stop()
         st.session_state.active_conversation_id = new_conversation_id
-        st.session_state.conversation_selector = new_conversation_id
         st.session_state.messages = []
         st.rerun()
     if clear_col.button("Clear chat", use_container_width=True):
@@ -516,28 +775,78 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-    selected_conversation_id = st.selectbox(
-        "Saved conversations",
-        options=[conversation["id"] for conversation in conversations],
-        format_func=lambda conversation_id: (
-            f"{conversation_by_id[conversation_id]['title']} · #{conversation_id}"
-        ),
-        key="conversation_selector",
-    )
-    if selected_conversation_id != st.session_state.active_conversation_id:
-        try:
-            st.session_state.messages = load_messages(selected_conversation_id)
-        except (OSError, sqlite3.Error, ValueError) as error:
-            st.error(f"Could not open this saved chat: {error}")
-            st.stop()
-        st.session_state.active_conversation_id = selected_conversation_id
+    st.caption("Saved conversations")
+    for conversation in conversations:
+        conversation_id = conversation["id"]
+        row_title, row_menu = st.columns([0.84, 0.16])
+        title_marker = "● " if conversation_id == st.session_state.active_conversation_id else ""
+        if row_title.button(
+            f"{title_marker}{conversation['title']}",
+            key=f"open_conversation_{conversation_id}",
+            use_container_width=True,
+            help=f"Open conversation #{conversation_id}",
+        ):
+            try:
+                st.session_state.messages = load_messages(conversation_id)
+            except (OSError, sqlite3.Error, ValueError) as error:
+                st.error(f"Could not open this saved chat: {error}")
+                st.stop()
+            st.session_state.active_conversation_id = conversation_id
+            st.session_state.editing_conversation_id = None
+            st.rerun()
+
+        if row_menu.button(
+            "✎",
+            key=f"edit_conversation_{conversation_id}",
+            help=f"Rename {conversation['title']}",
+            use_container_width=True,
+        ):
+            st.session_state.editing_conversation_id = conversation_id
+            st.session_state[f"rename_conversation_title_{conversation_id}"] = (
+                conversation["title"]
+            )
+            st.rerun()
+
+        if st.session_state.get("editing_conversation_id") == conversation_id:
+            rename_input_key = f"rename_conversation_title_{conversation_id}"
+            st.text_input(
+                "Conversation title",
+                key=rename_input_key,
+                max_chars=120,
+                placeholder="Conversation title",
+            )
+            save_col, cancel_col = st.columns(2)
+            if save_col.button(
+                "Save",
+                key=f"save_conversation_title_{conversation_id}",
+                use_container_width=True,
+            ):
+                try:
+                    rename_conversation(
+                        conversation_id,
+                        st.session_state[rename_input_key],
+                    )
+                except (OSError, sqlite3.Error, ValueError) as error:
+                    st.error(f"Could not rename this saved chat: {error}")
+                else:
+                    st.session_state.editing_conversation_id = None
+                    st.rerun()
+            if cancel_col.button(
+                "Cancel",
+                key=f"cancel_conversation_title_{conversation_id}",
+                use_container_width=True,
+            ):
+                st.session_state.editing_conversation_id = None
+                st.rerun()
 
     if st.button(
-        "🗑 Delete selected conversation",
+        "Delete selected conversation",
         use_container_width=True,
         key="delete_selected_conversation",
     ):
-        st.session_state.pending_delete_conversation_id = selected_conversation_id
+        st.session_state.pending_delete_conversation_id = (
+            st.session_state.active_conversation_id
+        )
     pending_delete_id = st.session_state.get("pending_delete_conversation_id")
     if pending_delete_id is not None and pending_delete_id in conversation_by_id:
         pending_title = conversation_by_id[pending_delete_id]["title"]
@@ -683,22 +992,6 @@ with st.sidebar:
                     index, chunks = run_indexing(result_urls, index, chunks)
             except (RuntimeError, ValueError) as error:
                 st.error(str(error))
-
-st.markdown(
-    """
-    <div class="hero">
-        <div class="hero-kicker">Your personal research workspace</div>
-        <h1>🌐 Web RAG Assistant</h1>
-        <p>Bring your files, the live web, and your questions together.</p>
-        <div class="hero-pills">
-            <span>✦ File answers</span>
-            <span>↗ Live web</span>
-            <span>◈ Cited sources</span>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
 
 if not st.session_state.messages:
     st.markdown(
@@ -874,7 +1167,7 @@ if user_question:
                     if index.ntotal or (
                         uploaded_index is not None and uploaded_index.ntotal
                     ):
-                        embedding_model = load_embedding_model()
+                        embedding_model = get_embedding_model()
                         query_embedding = embedding_model.encode(
                             [question],
                             convert_to_numpy=True,

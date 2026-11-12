@@ -7,7 +7,11 @@ from typing import TypedDict
 import faiss
 import numpy as np
 
-from embeddings import get_embedding_model
+from embeddings import (
+    EMBEDDING_BATCH_SIZE,
+    get_embedding_model,
+    iter_embedding_batches,
+)
 from processor import clean_text, split_into_chunks
 from scraper import (
     WebsiteScrapeError,
@@ -16,7 +20,10 @@ from scraper import (
     validate_website_url,
 )
 from search import search_web
-from vector_store import append_to_vector_store, search_vector_store
+from vector_store import (
+    append_to_vector_store_batches,
+    search_vector_store,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -91,10 +98,9 @@ def generate_embeddings(
     """Encode all new chunks in one batch using the shared model instance."""
     if not chunks:
         return np.empty((0, 384), dtype=np.float32)
-    texts = [chunk["text"] for chunk in chunks]
     return get_embedding_model().encode(
-        texts,
-        batch_size=32,
+        [chunk["text"] for chunk in chunks],
+        batch_size=EMBEDDING_BATCH_SIZE,
         show_progress_bar=show_progress_bar,
         convert_to_numpy=True,
     )
@@ -224,6 +230,7 @@ def update_knowledge_base(
             {"url": final_url, "title": page["title"], "text": text}
             for text in page_chunks
         )
+        del page, cleaned_content, page_chunks
         report["added_urls"].append(final_url)
         if progress_callback:
             progress_callback(
@@ -239,12 +246,16 @@ def update_knowledge_base(
 
     if progress_callback:
         progress_callback("Generating embeddings", total, total + 1)
-    embeddings = generate_embeddings(new_chunks, show_progress_bar=False)
-    updated_index, updated_chunks = append_to_vector_store(
+    embedding_batches = iter_embedding_batches(
+        (chunk["text"] for chunk in new_chunks),
+        batch_size=EMBEDDING_BATCH_SIZE,
+    )
+    updated_index, updated_chunks = append_to_vector_store_batches(
         index,
         chunks,
         new_chunks,
-        embeddings,
+        embedding_batches,
+        batch_size=EMBEDDING_BATCH_SIZE,
     )
     report["new_chunks"] = len(new_chunks)
     if progress_callback:
